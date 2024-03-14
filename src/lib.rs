@@ -1,4 +1,193 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
+use rcgen::CustomExtension;
+
+use std::fs;
+use std::io::{BufReader, Read};
+use std::path::Path;
+use std::sync::Arc;
+
+use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer};
+use rustls::server::{ServerConfig, WebPkiClientVerifier};
+use rustls::RootCertStore;
+
+/// A test PKI with a CA certificate, server certificate, and client certificate.
+pub struct TestPki {
+    server_config: Arc<ServerConfig>,
+    ca_cert: rcgen::Certificate,
+    /*
+    client_auth_roots: RootCertStore,
+    server_cert_der: CertificateDer<'static>,
+    server_key_der: PrivateKeyDer<'static>, */
+}
+
+impl TestPki {
+    /// Create a new test PKI using `rcgen`.
+    pub fn new(
+        intermediate_fullchain_path: &Path,
+        intermediate_key_path: &Path,
+        crl_paths: &[String],
+    ) -> Self {
+        let roots = Self::load_certs(intermediate_fullchain_path);
+        let mut client_auth_roots = RootCertStore::empty();
+        for root in roots {
+            client_auth_roots.add(root).unwrap();
+        }
+
+        let crls = Self::load_crls(crl_paths);
+
+        let certs = Self::load_certs(intermediate_fullchain_path);
+        let privkey = Self::load_private_key(intermediate_key_path);
+        let ocsp = Self::load_ocsp(&None);
+
+        let client_auth = WebPkiClientVerifier::builder(client_auth_roots.into())
+            .with_crls(crls)
+            .build()
+            .unwrap();
+
+        let config = ServerConfig::builder()
+            .with_client_cert_verifier(client_auth)
+            .with_single_cert_with_ocsp(certs.clone(), privkey.clone_key(), ocsp)
+            .expect("bad certificates/private key");
+        /*
+        config.key_log = Arc::new(KeyLogFile::new());
+
+        if args.flag_resumption {
+            config.session_storage = server::ServerSessionMemoryCache::new(256);
+        }
+
+        if args.flag_tickets {
+            config.ticketer = provider::Ticketer::new().unwrap();
+        }
+
+        config.alpn_protocols = args
+            .flag_proto
+            .iter()
+            .map(|proto| proto.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+         */
+
+        /*
+               let server_key_der = Self::load_private_key(intermediate_key_path);
+
+               let ca_cert = rcgen::Certificate::from_params(CertificateParams::from_ca_cert_der())
+        */
+
+        let ca_cert = rcgen::Certificate::from_params(
+            rcgen::CertificateParams::from_ca_cert_der(
+                certs.first().unwrap(),
+                rcgen::KeyPair::from_der(privkey.secret_der()).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        Self {
+            server_config: Arc::new(config),
+            ca_cert,
+        }
+    }
+
+    pub fn server_config(&self) -> Arc<ServerConfig> {
+        self.server_config.clone()
+    }
+
+    pub fn create_cert_and_key(&self, name: &str, days: i64) -> Result<(String, String)> {
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]);
+        params.is_ca = rcgen::IsCa::NoCa;
+        params.alg = &rcgen::PKCS_ECDSA_P256_SHA256;
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CountryName, "DE");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::StateOrProvinceName, "BY");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::OrganizationName, "conplement AG");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        params.not_before = time::OffsetDateTime::now_utc();
+        params.not_after = params
+            .not_before
+            .checked_add(time::Duration::days(days))
+            .unwrap();
+        //params.serial_number = ????
+
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::DigitalSignature,
+            rcgen::KeyUsagePurpose::KeyEncipherment,
+        ];
+        params.use_authority_key_identifier_extension = true;
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+
+        let device_cert = rcgen::Certificate::from_params(params).unwrap();
+        let device_cert_pem = device_cert
+            .serialize_pem_with_signer(&self.ca_cert)
+            .unwrap();
+        let private_key_pem = device_cert.serialize_private_key_pem();
+
+        Ok((device_cert_pem, private_key_pem))
+    }
+
+    fn load_certs(filename: &Path) -> Vec<CertificateDer<'static>> {
+        let certfile = fs::File::open(filename).expect("cannot open certificate file");
+        let mut reader = BufReader::new(certfile);
+        rustls_pemfile::certs(&mut reader)
+            .map(|result| result.unwrap())
+            .collect()
+    }
+
+    fn load_private_key(filename: &Path) -> PrivateKeyDer<'static> {
+        let keyfile = fs::File::open(filename).expect("cannot open private key file");
+        let mut reader = BufReader::new(keyfile);
+
+        loop {
+            match rustls_pemfile::read_one(&mut reader).expect("cannot parse private key .pem file")
+            {
+                Some(rustls_pemfile::Item::Pkcs1Key(key)) => return key.into(),
+                Some(rustls_pemfile::Item::Pkcs8Key(key)) => return key.into(),
+                Some(rustls_pemfile::Item::Sec1Key(key)) => return key.into(),
+                None => break,
+                _ => {}
+            }
+        }
+
+        panic!(
+            "no keys found in {:?} (encrypted keys not supported)",
+            filename
+        );
+    }
+
+    fn load_ocsp(filename: &Option<String>) -> Vec<u8> {
+        let mut ret = Vec::new();
+
+        if let Some(name) = filename {
+            fs::File::open(name)
+                .expect("cannot open ocsp file")
+                .read_to_end(&mut ret)
+                .unwrap();
+        }
+
+        ret
+    }
+
+    fn load_crls(filenames: &[String]) -> Vec<CertificateRevocationListDer<'static>> {
+        filenames
+            .iter()
+            .map(|filename| {
+                let mut der = Vec::new();
+                fs::File::open(filename)
+                    .expect("cannot open CRL file")
+                    .read_to_end(&mut der)
+                    .unwrap();
+                CertificateRevocationListDer::from(der)
+            })
+            .collect()
+    }
+}
+
+/* use anyhow::{Context, Result};
 use std::sync::Once;
 
 static OPENSSL_INIT_ONCE: Once = Once::new();
@@ -296,3 +485,4 @@ mod tests {
         assert_eq!(csr_subject, cert_subject);
     }
 }
+ */
